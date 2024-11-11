@@ -32,6 +32,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+import pytz
 
 import numpy as np
 from backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
@@ -84,6 +85,9 @@ def sample_sharegpt_requests(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
+    shuffle_dataset: Optional[bool] = False,
+    min_prompt_length: Optional[int] = 4,
+    max_prompt_length: Optional[int] = 1024,
 ) -> List[Tuple[str, int, int]]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -97,7 +101,8 @@ def sample_sharegpt_requests(
                 data["conversations"][1]["value"]) for data in dataset]
 
     # Shuffle the dataset.
-    random.shuffle(dataset)
+    if shuffle_dataset:
+        random.shuffle(dataset)
 
     # Filter out sequences that are too long or too short
     filtered_dataset: List[Tuple[str, int, int]] = []
@@ -113,10 +118,10 @@ def sample_sharegpt_requests(
         prompt_len = len(prompt_token_ids)
         output_len = len(completion_token_ids
                          ) if fixed_output_len is None else fixed_output_len
-        if prompt_len < 4 or output_len < 4:
+        if prompt_len < min_prompt_length or output_len < 4:
             # Prune too short sequences.
             continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
+        if prompt_len > max_prompt_length or prompt_len + output_len > 2048:
             # Prune too long sequences.
             continue
         filtered_dataset.append((prompt, prompt_len, output_len))
@@ -310,6 +315,17 @@ def calculate_metrics(
 
     return metrics, actual_output_lens
 
+def get_current_time():
+    pst_timezone = pytz.timezone('US/Pacific')
+
+    # Get the current time in UTC
+    current_time_utc = datetime.now(pytz.utc)
+
+    # Convert the current UTC time to PST
+    current_time_pst = current_time_utc.astimezone(pst_timezone)
+
+    # Return the string value of the datetime
+    return current_time_pst.strftime('%Y-%m-%d %H:%M:%S %Z%z')
 
 async def benchmark(
     backend: str,
@@ -370,6 +386,7 @@ async def benchmark(
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
     benchmark_start_time = time.perf_counter()
+    benchmark_start_time_pst = get_current_time()
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
         prompt, prompt_len, output_len = request
@@ -407,6 +424,7 @@ async def benchmark(
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
+    benchmark_end_time_pst = get_current_time()
 
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
@@ -445,6 +463,8 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "start_time": benchmark_start_time_pst,
+        "end_time": benchmark_end_time_pst,
     }
 
     def process_one_metric(
@@ -487,7 +507,7 @@ async def benchmark(
 
     print("=" * 50)
 
-    return result
+    return result, outputs
 
 
 def main(args: argparse.Namespace):
@@ -520,6 +540,9 @@ def main(args: argparse.Namespace):
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
+            shuffle_dataset=args.shuffle_dataset,
+            min_prompt_length=args.min_prompt_length,
+            max_prompt_length=args.max_prompt_length
         )
 
     elif args.dataset_name == "sharegpt":
@@ -528,6 +551,9 @@ def main(args: argparse.Namespace):
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
+            shuffle_dataset=args.shuffle_dataset,
+            min_prompt_length=args.min_prompt_length,
+            max_prompt_length=args.max_prompt_length
         )
 
     elif args.dataset_name == "sonnet":
@@ -572,7 +598,7 @@ def main(args: argparse.Namespace):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
-    benchmark_result = asyncio.run(
+    benchmark_result, outputs = asyncio.run(
         benchmark(
             backend=backend,
             api_url=api_url,
@@ -621,17 +647,18 @@ def main(args: argparse.Namespace):
             args.request_rate if args.request_rate < float("inf") else "inf")
 
         # Merge with benchmark result
-        result_json = {**result_json, **benchmark_result}
+        result_json = {**result_json, **benchmark_result, "outputs": [output.to_dict() for output in outputs]}
 
         # Save to file
         base_model_id = model_id.split("/")[-1]
-        file_name = f"{backend}-{args.request_rate}qps-{base_model_id}-{current_dt}.json"  #noqa
+        file_name = f"inference-benchmark-{backend}-{args.request_rate}qps-{base_model_id}-{current_dt}.json"  #noqa
         if args.result_filename:
             file_name = args.result_filename
         if args.result_dir:
             file_name = os.path.join(args.result_dir, file_name)
         with open(file_name, "w") as outfile:
             json.dump(result_json, outfile)
+            print(f"Saved outputs to {file_name}")
 
 
 if __name__ == "__main__":
@@ -671,6 +698,28 @@ if __name__ == "__main__":
         choices=["sharegpt", "sonnet", "random"],
         help="Name of the dataset to benchmark on.",
     )
+
+    parser.add_argument(
+        "--shuffle-dataset",
+        type=bool,
+        default=False,
+        help="Whether to shuffle the dataset. When doing a parameter sweep, best to set this to false to control the experiment.",
+    )
+
+    parser.add_argument(
+        "--min-prompt-length",
+        type=int,
+        default=4,
+        help="Helps control variance of the results. Only works for sharegpt dataset.",
+    )
+
+    parser.add_argument(
+        "--max-prompt-length",
+        type=int,
+        default=1024,
+        help="Helps control variance of the results. Only works for sharegpt dataset.",
+    )
+
     parser.add_argument("--dataset-path",
                         type=str,
                         default=None,

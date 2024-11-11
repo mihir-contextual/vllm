@@ -35,7 +35,20 @@ class RequestFuncOutput:
     itl: List[float] = field(
         default_factory=list)  # List of inter-token latencies
     prompt_len: int = 0
+    prompt: str = ""
     error: str = ""
+    
+    def to_dict(self):
+        return {
+            'generated_text': self.generated_text,
+            'success': self.success,
+            'latency': self.latency,
+            'ttft': self.ttft,
+            'itl': self.itl,
+            'prompt_len': self.prompt_len,
+            'prompt': self.prompt,
+            'error': self.error
+        }
 
 
 async def async_request_tgi(
@@ -244,6 +257,7 @@ async def async_request_openai_completions(
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
+        output.prompt = request_func_input.prompt
 
         generated_text = ""
         ttft = 0.0
